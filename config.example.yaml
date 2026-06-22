@@ -1,11 +1,39 @@
 management_clusters:
   - name: prod
-    kubeconfig: /home/user/.kube/prod-mgmt.yaml
-    # context: prod-admin  # optional: restrict to one context
+    kubeconfig: $XDG_CONFIG_HOME/kube/prod-mgmt.yaml
+
   - name: dev
-    kubeconfig: /home/user/.kube/dev-mgmt.yaml
-    context: dev-admin
+    kubeconfig: $XDG_CONFIG_HOME/kube/dev-mgmt.yaml
+    sshuttle_host: user@bastion.example.com  # per-cluster override
+
+  # Optional per-cluster overrides:
+  # context: prod-admin        # restrict to one context
+  # sshuttle_host: ...         # overrides global sshuttle_host
+
+sshuttle_host: gateway  # global fallback for all clusters
+
+transforms:
+  users: >-
+    {name: .name, user: {exec: {
+      apiVersion: "client.authentication.k8s.io/v1beta1",
+      command: "kubectl",
+      args: [
+        "oidc-login", "get-token",
+        "--oidc-issuer-url=https://staff-auth.k8s.teuto.net",
+        "--token-cache-storage=keyring",
+        "--oidc-client-id=kubernetes",
+        "--oidc-extra-scope=email",
+        "--oidc-extra-scope=groups",
+        "--oidc-extra-scope=offline_access",
+        "--open-url-after-authentication="
+      ]
+    }}}
+
+custom_fields:
+  friendly_name: '.metadata.annotations["t8s.teuto.net/cluster"] // "" | try @base64d'
+  customer_name: '(.metadata.annotations["t8s.teuto.net/customer-name"] | if . != null then try @base64d else null end) // .metadata.labels["t8s.teuto.net/customer-id"]'
+  customer_id: '.metadata.labels["t8s.teuto.net/customer-id"]'
 
 cache:
   cluster_list_ttl: 300   # seconds; default 300
-  kubeconfig_ttl: 3600    # seconds; default 3600
+  kubeconfig_ttl: 3600    # seconds; default 3600 (also controls sshuttle proxy lifetime)
