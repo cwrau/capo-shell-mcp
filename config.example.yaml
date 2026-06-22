@@ -1,0 +1,11 @@
+management_clusters:
+  - name: prod
+    kubeconfig: /home/user/.kube/prod-mgmt.yaml
+    # context: prod-admin  # optional: restrict to one context
+  - name: dev
+    kubeconfig: /home/user/.kube/dev-mgmt.yaml
+    context: dev-admin
+
+cache:
+  cluster_list_ttl: 300   # seconds; default 300
+  kubeconfig_ttl: 3600    # seconds; default 3600
