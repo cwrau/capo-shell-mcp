@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/cwrau/capo-shell-mcp/compare/capo-shell-mcp-v0.2.0...capo-shell-mcp-v0.3.0) (2026-07-01)
+
+
+### Features
+
+* add read-only functions ([c732445](https://github.com/cwrau/capo-shell-mcp/commit/c73244561c2179025833c4c41ec1045752987754))
+
 ## [0.2.0](https://github.com/cwrau/capo-shell-mcp/compare/capo-shell-mcp-v0.1.0...capo-shell-mcp-v0.2.0) (2026-06-23)
 
 
