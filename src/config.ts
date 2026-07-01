@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import yaml from 'js-yaml';
+import { load } from 'js-yaml';
 
 export interface KubeconfigTransforms {
   clusters?: string;
@@ -62,7 +62,7 @@ function parseCustomFields(raw: unknown): Record<string, string> | undefined {
 }
 
 export function loadConfig(): AppConfig {
-  const raw = yaml.load(fs.readFileSync(configPath(), 'utf8')) as Record<string, unknown>;
+  const raw = load(fs.readFileSync(configPath(), 'utf8')) as Record<string, unknown>;
 
   if (!Array.isArray(raw?.management_clusters) || raw.management_clusters.length === 0) {
     throw new Error('config: management_clusters must be a non-empty array');

@@ -1,4 +1,4 @@
-import yaml from 'js-yaml';
+import { load, dump } from 'js-yaml';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -96,9 +96,9 @@ export async function applyKubeconfigTransform(kcYaml: string, transforms: Kubec
   if (transforms.clusters) parts.push(`.clusters |= map(${transforms.clusters})`);
   if (transforms.contexts) parts.push(`.contexts |= map(${transforms.contexts})`);
   if (transforms.users) parts.push(`.users |= map(${transforms.users})`);
-  const input = JSON.stringify(yaml.load(kcYaml));
+  const input = JSON.stringify(load(kcYaml));
   const { stdout } = await shell.execFile('jq', [parts.join(' | ')], { input });
-  return yaml.dump(JSON.parse(stdout));
+  return dump(JSON.parse(stdout));
 }
 
 export async function fetchOpenStackEnv(
@@ -138,7 +138,7 @@ export async function fetchOpenStackEnv(
     { env: kubectlEnv(mgmt.kubeconfig) },
   );
   const cloudsYaml = Buffer.from(secretOut.trim(), 'base64').toString('utf8');
-  const clouds = yaml.load(cloudsYaml) as {
+  const clouds = load(cloudsYaml) as {
     clouds: Record<string, {
       auth: Record<string, string>;
       region_name?: string;
@@ -235,7 +235,7 @@ export async function createReadOnlyKubeconfig(
   adminKcYaml: string,
   durationSeconds: number,
 ): Promise<string> {
-  const parsed = yaml.load(adminKcYaml) as {
+  const parsed = load(adminKcYaml) as {
     clusters: Array<{ cluster: { server: string; 'certificate-authority-data': string } }>;
   };
   const clusterInfo = parsed.clusters[0]?.cluster;
@@ -258,7 +258,7 @@ export async function createReadOnlyKubeconfig(
       { env },
     );
 
-    return yaml.dump({
+    return dump({
       apiVersion: 'v1',
       kind: 'Config',
       clusters: [{
