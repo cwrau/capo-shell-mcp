@@ -9,6 +9,7 @@ import {
   applyKubeconfigTransform,
   fetchOpenStackEnv,
   fetchApiServerInfo,
+  createReadOnlyKubeconfig,
 } from './k8s.js';
 import { execWithKubeconfig } from './exec.js';
 import { ensureProxy, refreshProxy } from './proxy.js';
@@ -160,6 +161,66 @@ export function buildServer(): McpServer {
         `EXIT CODE: ${result.exitCode}`,
       ].filter(Boolean);
 
+      return {
+        content: [{ type: 'text' as const, text: parts.join('\n\n') }],
+        isError: result.exitCode !== 0,
+      };
+    },
+  );
+
+  server.tool(
+    'get_cluster_kubeconfig_readonly',
+    'Return a read-only kubeconfig for a CAPO workload cluster using the TokenRequest API. Always applies ServiceAccount capo-shell-mcp-read-only (bound to ClusterRole/view) to the workload cluster. Token lifetime matches kubeconfig_ttl.',
+    {
+      management_cluster: z.string().describe('Management cluster name (from config).'),
+      context: z.string().describe('kubectl context within the management cluster kubeconfig.'),
+      namespace: z.string().describe('Namespace of the workload cluster.'),
+      cluster_name: z.string().describe('Workload cluster name (Cluster CR name).'),
+    },
+    async ({ management_cluster, context, namespace, cluster_name }) => {
+      const mgmt = findMgmt(config, management_cluster);
+      if (!mgmt) {
+        return {
+          content: [{ type: 'text' as const, text: `Unknown management cluster: ${management_cluster}` }],
+          isError: true,
+        };
+      }
+      const adminKc = await cachedKubeconfig(
+        cache, config, mgmt, context, namespace, cluster_name, config.cache.kubeconfig_ttl,
+      );
+      const roKc = await createReadOnlyKubeconfig(adminKc, config.cache.kubeconfig_ttl);
+      return { content: [{ type: 'text' as const, text: roKc }] };
+    },
+  );
+
+  server.tool(
+    'exec_in_cluster_readonly',
+    'Run a command with a read-only kubeconfig for the workload cluster. Always applies ServiceAccount capo-shell-mcp-read-only (bound to ClusterRole/view) via TokenRequest API. No OpenStack credentials are injected.',
+    {
+      management_cluster: z.string().describe('Management cluster name (from config).'),
+      context: z.string().describe('kubectl context within the management cluster kubeconfig.'),
+      namespace: z.string().describe('Namespace of the workload cluster.'),
+      cluster_name: z.string().describe('Workload cluster name (Cluster CR name).'),
+      command: z.array(z.string()).min(1).describe('Command + args to run, e.g. ["kubectl","get","nodes"].'),
+    },
+    async ({ management_cluster, context, namespace, cluster_name, command }) => {
+      const mgmt = findMgmt(config, management_cluster);
+      if (!mgmt) {
+        return {
+          content: [{ type: 'text' as const, text: `Unknown management cluster: ${management_cluster}` }],
+          isError: true,
+        };
+      }
+      const adminKc = await cachedKubeconfig(
+        cache, config, mgmt, context, namespace, cluster_name, config.cache.kubeconfig_ttl,
+      );
+      const roKc = await createReadOnlyKubeconfig(adminKc, config.cache.kubeconfig_ttl);
+      const result = await execWithKubeconfig(roKc, {}, command);
+      const parts = [
+        result.stdout && `STDOUT:\n${result.stdout}`,
+        result.stderr && `STDERR:\n${result.stderr}`,
+        `EXIT CODE: ${result.exitCode}`,
+      ].filter(Boolean);
       return {
         content: [{ type: 'text' as const, text: parts.join('\n\n') }],
         isError: result.exitCode !== 0,

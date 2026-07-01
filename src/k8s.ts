@@ -1,4 +1,7 @@
 import yaml from 'js-yaml';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { shell } from './shell.js';
 import type { ManagementClusterConfig, KubeconfigTransforms } from './config.js';
 
@@ -199,4 +202,80 @@ export async function fetchApiServerInfo(
   if (!item) return null;
   if (!item.spec.apiServerLoadBalancer?.allowedCIDRs?.length) return null;
   return item.spec.controlPlaneEndpoint?.host ?? null;
+}
+
+const READONLY_SA_NAME = 'capo-shell-mcp-read-only';
+const READONLY_NAMESPACE = 'default';
+
+const READONLY_MANIFEST = `\
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${READONLY_SA_NAME}
+  namespace: ${READONLY_NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${READONLY_SA_NAME}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+- kind: ServiceAccount
+  name: ${READONLY_SA_NAME}
+  namespace: ${READONLY_NAMESPACE}
+`;
+
+export async function createReadOnlyKubeconfig(
+  adminKcYaml: string,
+  durationSeconds: number,
+): Promise<string> {
+  const parsed = yaml.load(adminKcYaml) as {
+    clusters: Array<{ cluster: { server: string; 'certificate-authority-data': string } }>;
+  };
+  const clusterInfo = parsed.clusters[0]?.cluster;
+  if (!clusterInfo) throw new Error('createReadOnlyKubeconfig: no cluster found in admin kubeconfig');
+
+  const tmpFile = path.join(
+    os.tmpdir(),
+    `capo-shell-mcp-admin-${Math.random().toString(36).slice(2)}.yaml`,
+  );
+  await fs.writeFile(tmpFile, adminKcYaml, { mode: 0o600 });
+
+  try {
+    const env: NodeJS.ProcessEnv = { ...process.env, KUBECONFIG: tmpFile };
+
+    await shell.execFile('kubectl', ['apply', '-f', '-'], { env, input: READONLY_MANIFEST });
+
+    const { stdout: token } = await shell.execFile(
+      'kubectl',
+      ['create', 'token', READONLY_SA_NAME, '--namespace', READONLY_NAMESPACE, '--duration', `${durationSeconds}s`],
+      { env },
+    );
+
+    return yaml.dump({
+      apiVersion: 'v1',
+      kind: 'Config',
+      clusters: [{
+        name: 'workload',
+        cluster: {
+          server: clusterInfo.server,
+          'certificate-authority-data': clusterInfo['certificate-authority-data'],
+        },
+      }],
+      contexts: [{
+        name: 'readonly',
+        context: { cluster: 'workload', user: READONLY_SA_NAME, namespace: READONLY_NAMESPACE },
+      }],
+      'current-context': 'readonly',
+      users: [{
+        name: READONLY_SA_NAME,
+        user: { token: token.trim() },
+      }],
+    });
+  } finally {
+    await fs.unlink(tmpFile).catch(() => undefined);
+  }
 }

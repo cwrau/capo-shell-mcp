@@ -1,5 +1,8 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { shell } from '../shell.js';
+import * as fsPromises from 'node:fs/promises';
+
+vi.mock('node:fs/promises');
 
 const mgmt = { name: 'prod', kubeconfig: '/kube/prod.yaml', context: undefined };
 
@@ -248,5 +251,118 @@ describe('fetchApiServerInfo', () => {
       ]),
       expect.anything(),
     );
+  });
+});
+
+describe('createReadOnlyKubeconfig', () => {
+  const adminKcYaml = `\
+apiVersion: v1
+kind: Config
+clusters:
+- name: workload
+  cluster:
+    server: https://10.0.0.1:6443
+    certificate-authority-data: dGVzdC1jYQ==
+contexts:
+- name: admin
+  context:
+    cluster: workload
+    user: admin
+current-context: admin
+users:
+- name: admin
+  user:
+    token: old-admin-token
+`;
+
+  beforeEach(() => {
+    vi.mocked(fsPromises.writeFile).mockResolvedValue(undefined);
+    vi.mocked(fsPromises.unlink).mockResolvedValue(undefined);
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it('applies SA and CRB then creates token', async () => {
+    vi.spyOn(shell, 'execFile')
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })         // kubectl apply
+      .mockResolvedValueOnce({ stdout: 'mytoken\n', stderr: '' }); // kubectl create token
+
+    const { createReadOnlyKubeconfig } = await import('../k8s.js');
+    await createReadOnlyKubeconfig(adminKcYaml, 3600);
+
+    expect(shell.execFile).toHaveBeenNthCalledWith(
+      1,
+      'kubectl',
+      ['apply', '-f', '-'],
+      expect.objectContaining({
+        input: expect.stringContaining('capo-shell-mcp-read-only'),
+        env: expect.objectContaining({ KUBECONFIG: expect.stringMatching(/\.yaml$/) }),
+      }),
+    );
+    expect(shell.execFile).toHaveBeenNthCalledWith(
+      2,
+      'kubectl',
+      ['create', 'token', 'capo-shell-mcp-read-only', '--namespace', 'default', '--duration', '3600s'],
+      expect.objectContaining({
+        env: expect.objectContaining({ KUBECONFIG: expect.stringMatching(/\.yaml$/) }),
+      }),
+    );
+  });
+
+  it('returns kubeconfig YAML with token, server, and CA data', async () => {
+    vi.spyOn(shell, 'execFile')
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })
+      .mockResolvedValueOnce({ stdout: 'mytoken\n', stderr: '' });
+
+    const { createReadOnlyKubeconfig } = await import('../k8s.js');
+    const result = await createReadOnlyKubeconfig(adminKcYaml, 3600);
+
+    const yaml = await import('js-yaml');
+    const parsed = yaml.load(result) as {
+      clusters: Array<{ cluster: { server: string; 'certificate-authority-data': string } }>;
+      users: Array<{ user: { token: string } }>;
+      'current-context': string;
+    };
+    expect(parsed.clusters[0].cluster.server).toBe('https://10.0.0.1:6443');
+    expect(parsed.clusters[0].cluster['certificate-authority-data']).toBe('dGVzdC1jYQ==');
+    expect(parsed.users[0].user.token).toBe('mytoken');
+    expect(parsed['current-context']).toBe('readonly');
+  });
+
+  it('includes SA and CRB in apply manifest', async () => {
+    let capturedInput = '';
+    vi.spyOn(shell, 'execFile').mockImplementation(async (_bin, args, opts) => {
+      if (args[0] === 'apply') capturedInput = (opts as { input?: string }).input ?? '';
+      return { stdout: 'tok\n', stderr: '' };
+    });
+
+    const { createReadOnlyKubeconfig } = await import('../k8s.js');
+    await createReadOnlyKubeconfig(adminKcYaml, 60);
+
+    expect(capturedInput).toContain('kind: ServiceAccount');
+    expect(capturedInput).toContain('kind: ClusterRoleBinding');
+    expect(capturedInput).toContain('name: view');
+    expect(capturedInput).toContain('namespace: default');
+  });
+
+  it('deletes temp file on success', async () => {
+    vi.spyOn(shell, 'execFile').mockResolvedValue({ stdout: 'tok\n', stderr: '' });
+    const { createReadOnlyKubeconfig } = await import('../k8s.js');
+    await createReadOnlyKubeconfig(adminKcYaml, 60);
+    expect(fsPromises.unlink).toHaveBeenCalledOnce();
+  });
+
+  it('deletes temp file when kubectl apply fails', async () => {
+    vi.spyOn(shell, 'execFile').mockRejectedValue(new Error('apply failed'));
+    const { createReadOnlyKubeconfig } = await import('../k8s.js');
+    await expect(createReadOnlyKubeconfig(adminKcYaml, 60)).rejects.toThrow('apply failed');
+    expect(fsPromises.unlink).toHaveBeenCalledOnce();
+  });
+
+  it('throws when admin kubeconfig has no clusters', async () => {
+    vi.spyOn(shell, 'execFile').mockResolvedValue({ stdout: '', stderr: '' });
+    const { createReadOnlyKubeconfig } = await import('../k8s.js');
+    const empty = 'apiVersion: v1\nkind: Config\nclusters: []\n';
+    await expect(createReadOnlyKubeconfig(empty, 60)).rejects.toThrow(/no cluster/);
   });
 });
