@@ -1,20 +1,20 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import type { AppConfig, ManagementClusterConfig } from './config.js';
 import { loadConfig } from './config.js';
-import { createCacheStore, clusterListKey, kubeconfigKey } from './cache.js';
+import type { CacheStore } from './cache.js';
+import { clusterListKey, createCacheStore, kubeconfigKey } from './cache.js';
 import {
+  applyKubeconfigTransform,
+  createReadOnlyKubeconfig,
+  fetchApiServerInfo,
+  fetchOpenStackEnv,
+  fetchWorkloadKubeconfig,
   getContexts,
   listClustersForContext,
-  fetchWorkloadKubeconfig,
-  applyKubeconfigTransform,
-  fetchOpenStackEnv,
-  fetchApiServerInfo,
-  createReadOnlyKubeconfig,
 } from './k8s.js';
 import { execWithKubeconfig } from './exec.js';
 import { ensureProxy, refreshProxy } from './proxy.js';
-import type { AppConfig, ManagementClusterConfig } from './config.js';
-import type { CacheStore } from './cache.js';
 
 function findMgmt(config: AppConfig, name: string): ManagementClusterConfig | undefined {
   return config.management_clusters.find((m) => m.name === name);
@@ -49,9 +49,10 @@ async function cachedKubeconfig(
   cache.kubeconfig.set(key, kc);
 
   if (sshuttleHost) {
-    const apiIp = await fetchApiServerInfo(mgmt, context, namespace, clusterName);
-    if (apiIp) {
-      await ensureProxy(key, sshuttleHost, apiIp, ttlSeconds);
+    const apiServerInfo = await fetchApiServerInfo(mgmt, context, namespace, clusterName);
+    if (apiServerInfo) {
+      const [apiIp, apiPort] = apiServerInfo;
+      await ensureProxy(key, sshuttleHost, apiIp, apiPort, ttlSeconds);
     }
   }
 
@@ -138,8 +139,9 @@ export function buildServer(): McpServer {
       namespace: z.string().describe('Namespace of the workload cluster.'),
       cluster_name: z.string().describe('Workload cluster name (Cluster CR name).'),
       command: z.array(z.string()).min(1).describe('Command + args to run, e.g. ["kubectl","get","nodes"].'),
+      stdin: z.string().optional().describe('Data to pipe to the command\'s stdin, e.g. YAML for "kubectl apply -f -".'),
     },
-    async ({ management_cluster, context, namespace, cluster_name, command }) => {
+    async ({ management_cluster, context, namespace, cluster_name, command, stdin }) => {
       const mgmt = findMgmt(config, management_cluster);
       if (!mgmt) {
         return {
@@ -153,7 +155,7 @@ export function buildServer(): McpServer {
         fetchOpenStackEnv(mgmt, context, namespace, cluster_name),
       ]);
 
-      const result = await execWithKubeconfig(kc, osEnv, command);
+      const result = await execWithKubeconfig(kc, osEnv, command, stdin);
 
       const parts = [
         result.stdout && `STDOUT:\n${result.stdout}`,
@@ -202,8 +204,9 @@ export function buildServer(): McpServer {
       namespace: z.string().describe('Namespace of the workload cluster.'),
       cluster_name: z.string().describe('Workload cluster name (Cluster CR name).'),
       command: z.array(z.string()).min(1).describe('Command + args to run, e.g. ["kubectl","get","nodes"].'),
+      stdin: z.string().optional().describe('Data to pipe to the command\'s stdin, e.g. YAML for "kubectl apply -f -".'),
     },
-    async ({ management_cluster, context, namespace, cluster_name, command }) => {
+    async ({ management_cluster, context, namespace, cluster_name, command, stdin }) => {
       const mgmt = findMgmt(config, management_cluster);
       if (!mgmt) {
         return {
@@ -215,7 +218,7 @@ export function buildServer(): McpServer {
         cache, config, mgmt, context, namespace, cluster_name, config.cache.kubeconfig_ttl,
       );
       const roKc = await createReadOnlyKubeconfig(adminKc, config.cache.kubeconfig_ttl);
-      const result = await execWithKubeconfig(roKc, {}, command);
+      const result = await execWithKubeconfig(roKc, {}, command, stdin);
       const parts = [
         result.stdout && `STDOUT:\n${result.stdout}`,
         result.stderr && `STDERR:\n${result.stderr}`,

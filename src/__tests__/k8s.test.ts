@@ -220,20 +220,20 @@ describe('fetchApiServerInfo', () => {
     expect(await fetchApiServerInfo(mgmt, 'ctx-a', 'ns-1', 'cluster-1')).toBeNull();
   });
 
-  it('returns API server IP when allowedCIDRs present', async () => {
+  it('returns [host, port] when allowedCIDRs present', async () => {
     vi.spyOn(shell, 'execFile').mockResolvedValue({
       stdout: JSON.stringify({
         items: [{
           spec: {
             apiServerLoadBalancer: { allowedCIDRs: ['0.0.0.0/0'] },
-            controlPlaneEndpoint: { host: '10.0.0.1' },
+            controlPlaneEndpoint: { host: '10.0.0.1', port: '6443' },
           },
         }],
       }),
       stderr: '',
     });
     const { fetchApiServerInfo } = await import('../k8s.js');
-    expect(await fetchApiServerInfo(mgmt, 'ctx-a', 'ns-1', 'cluster-1')).toBe('10.0.0.1');
+    expect(await fetchApiServerInfo(mgmt, 'ctx-a', 'ns-1', 'cluster-1')).toEqual(['10.0.0.1', '6443']);
   });
 
   it('uses label selector', async () => {

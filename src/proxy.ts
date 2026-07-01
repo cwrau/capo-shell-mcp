@@ -8,8 +8,8 @@ interface ProxyEntry {
 const proxyStore = new Map<string, ProxyEntry>();
 
 export const proxyShell = {
-  spawn(host: string, ip: string): ChildProcess {
-    return spawn('sshuttle', ['-r', host, `${ip}/32`], { stdio: 'ignore' });
+  spawn(host: string, ip: string, port: string): ChildProcess {
+    return spawn('sshuttle', ['-r', host, `${ip}:${port}`], { stdio: 'ignore' });
   },
 };
 
@@ -36,6 +36,7 @@ export async function ensureProxy(
   key: string,
   sshuttleHost: string,
   apiServerIp: string,
+  apiServerPort: string,
   ttlSeconds: number,
 ): Promise<void> {
   if (proxyStore.has(key)) {
@@ -43,7 +44,7 @@ export async function ensureProxy(
     return;
   }
 
-  const proc = proxyShell.spawn(sshuttleHost, apiServerIp);
+  const proc = proxyShell.spawn(sshuttleHost, apiServerIp, apiServerPort);
   proc.unref();
 
   // Wait up to 1s for sshuttle to start; reject if it dies first

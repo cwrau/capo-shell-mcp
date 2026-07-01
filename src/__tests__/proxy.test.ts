@@ -30,12 +30,12 @@ describe('ensureProxy', () => {
     const fakeProc = makeFakeProcess();
     vi.spyOn(proxyShell, 'spawn').mockReturnValue(fakeProc as never);
 
-    const promise = ensureProxy('key1', 'user@bastion', '10.0.0.1', 60);
+    const promise = ensureProxy('key1', 'user@bastion', '10.0.0.1', '6443', 60);
     // Advance past the 1s startup window
     await vi.advanceTimersByTimeAsync(1100);
     await promise;
 
-    expect(proxyShell.spawn).toHaveBeenCalledWith('user@bastion', '10.0.0.1');
+    expect(proxyShell.spawn).toHaveBeenCalledWith('user@bastion', '10.0.0.1', '6443');
     expect(fakeProc.unref).toHaveBeenCalled();
   });
 
@@ -43,12 +43,12 @@ describe('ensureProxy', () => {
     const fakeProc = makeFakeProcess();
     vi.spyOn(proxyShell, 'spawn').mockReturnValue(fakeProc as never);
 
-    const p1 = ensureProxy('key2', 'user@bastion', '10.0.0.1', 60);
+    const p1 = ensureProxy('key2', 'user@bastion', '10.0.0.1', '6443', 60);
     await vi.advanceTimersByTimeAsync(1100);
     await p1;
 
     // Second call should not spawn again
-    await ensureProxy('key2', 'user@bastion', '10.0.0.1', 60);
+    await ensureProxy('key2', 'user@bastion', '10.0.0.1', '6443', 60);
     expect(proxyShell.spawn).toHaveBeenCalledTimes(1);
   });
 
@@ -56,7 +56,7 @@ describe('ensureProxy', () => {
     const fakeProc = makeFakeProcess();
     vi.spyOn(proxyShell, 'spawn').mockReturnValue(fakeProc as never);
 
-    const p = ensureProxy('key3', 'user@bastion', '10.0.0.1', 60);
+    const p = ensureProxy('key3', 'user@bastion', '10.0.0.1', '6443', 60);
     await vi.advanceTimersByTimeAsync(1100);
     await p;
 
@@ -69,7 +69,7 @@ describe('ensureProxy', () => {
     const fakeProc = makeFakeProcess();
     vi.spyOn(proxyShell, 'spawn').mockReturnValue(fakeProc as never);
 
-    const promise = ensureProxy('key4', 'user@bastion', '10.0.0.1', 60);
+    const promise = ensureProxy('key4', 'user@bastion', '10.0.0.1', '6443', 60);
     // Simulate sshuttle dying immediately
     fakeProc.emit('exit', 1);
 
@@ -93,7 +93,7 @@ describe('refreshProxy', () => {
     const fakeProc = makeFakeProcess();
     vi.spyOn(proxyShell, 'spawn').mockReturnValue(fakeProc as never);
 
-    const p = ensureProxy('key5', 'user@bastion', '10.0.0.1', 60);
+    const p = ensureProxy('key5', 'user@bastion', '10.0.0.1', '6443', 60);
     await vi.advanceTimersByTimeAsync(1100);
     await p;
 
@@ -127,7 +127,7 @@ describe('killProxy', () => {
     const fakeProc = makeFakeProcess();
     vi.spyOn(proxyShell, 'spawn').mockReturnValue(fakeProc as never);
 
-    const p = ensureProxy('key6', 'user@bastion', '10.0.0.1', 60);
+    const p = ensureProxy('key6', 'user@bastion', '10.0.0.1', '6443', 60);
     await vi.advanceTimersByTimeAsync(1100);
     await p;
 

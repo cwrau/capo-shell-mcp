@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { shell } from './shell.js';
-import type { ManagementClusterConfig, KubeconfigTransforms } from './config.js';
+import type { KubeconfigTransforms, ManagementClusterConfig } from './config.js';
 
 export interface CAPOCluster {
   management_cluster: string;
@@ -172,13 +172,13 @@ export async function fetchOpenStackEnv(
   ) as Record<string, string>;
 }
 
-// Returns the API server IP if the cluster has restricted allowedCIDRs, null otherwise.
+// Returns [host, port] if the cluster has restricted allowedCIDRs, null otherwise.
 export async function fetchApiServerInfo(
   mgmt: ManagementClusterConfig,
   context: string,
   namespace: string,
   clusterName: string,
-): Promise<string | null> {
+): Promise<[string, string] | null> {
   const { stdout } = await shell.execFile(
     'kubectl',
     [
@@ -194,14 +194,17 @@ export async function fetchApiServerInfo(
     items: Array<{
       spec: {
         apiServerLoadBalancer?: { allowedCIDRs?: string[] };
-        controlPlaneEndpoint?: { host: string };
+        controlPlaneEndpoint?: { host: string; port: string };
       };
     }>;
   };
   const item = parsed.items[0];
   if (!item) return null;
   if (!item.spec.apiServerLoadBalancer?.allowedCIDRs?.length) return null;
-  return item.spec.controlPlaneEndpoint?.host ?? null;
+  const apiHost = item.spec.controlPlaneEndpoint?.host;
+  const apiPort = item.spec.controlPlaneEndpoint?.port;
+  if (apiHost && apiPort) return [apiHost, apiPort];
+  return null;
 }
 
 const READONLY_SA_NAME = 'capo-shell-mcp-read-only';

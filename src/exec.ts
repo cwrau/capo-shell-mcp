@@ -13,6 +13,7 @@ export async function execWithKubeconfig(
   workloadKubeconfig: string,
   openstackEnv: Record<string, string>,
   command: string[],
+  stdin?: string,
 ): Promise<ExecResult> {
   if (command.length === 0) throw new Error('exec: command must be non-empty');
 
@@ -31,6 +32,7 @@ export async function execWithKubeconfig(
       const { stdout, stderr } = await shell.execFile(bin, args, {
         env,
         maxBuffer: 10 * 1024 * 1024,
+        input: stdin,
       });
       return { stdout, stderr, exitCode: 0 };
     } catch (err: unknown) {
