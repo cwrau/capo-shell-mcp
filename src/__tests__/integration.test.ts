@@ -1,21 +1,41 @@
 /**
- * Integration tests — kubectl is mocked, jq runs for real.
+ * Integration tests — the Kubernetes API client is mocked, jq runs for real.
  * Validates actual jq expressions used in production config.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { shell } from '../shell.js';
 import * as fs from 'node:fs';
+import { shell } from '../shell.js';
 
 vi.mock('node:fs');
 
-// Capture original before any spy replaces it
+// Capture original before any spy replaces it — jq still runs for real
 const realExecFile = shell.execFile.bind(shell);
+function spyOnJq() {
+  vi.spyOn(shell, 'execFile').mockImplementation(realExecFile);
+}
 
-function mockKubectl(kubectlOutput: string) {
-  vi.spyOn(shell, 'execFile').mockImplementation(async (cmd, args, opts) => {
-    if (cmd === 'kubectl') return { stdout: kubectlOutput, stderr: '' };
-    return realExecFile(cmd, args, opts);  // jq runs for real
-  });
+const stubs = vi.hoisted(() => ({
+  customObjects: {} as Record<string, ReturnType<typeof vi.fn>>,
+}));
+
+vi.mock('@kubernetes/client-node', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kubernetes/client-node')>();
+
+  class FakeKubeConfig {
+    loadFromFile(_path: string) {}
+    loadFromString(_yaml: string) {}
+    setCurrentContext(_ctx: string) {}
+    makeApiClient(apiClientType: unknown) {
+      if (apiClientType === actual.CustomObjectsApi) return stubs.customObjects;
+      throw new Error('unexpected api client type in test');
+    }
+  }
+
+  return { ...actual, KubeConfig: FakeKubeConfig };
+});
+
+function mockClusterList(items: unknown[]) {
+  stubs.customObjects.listCustomObjectForAllNamespaces = vi.fn().mockResolvedValue({ items });
 }
 
 const mgmt = { name: 'prod', kubeconfig: '/kube/prod.yaml', context: undefined };
@@ -38,7 +58,7 @@ describe('custom_fields with real jq', () => {
         labels: {},
       },
     }];
-    mockKubectl(JSON.stringify({ items }));
+    mockClusterList(items);
 
     const { listClustersForContext } = await import('../k8s.js');
     const result = await listClustersForContext(
@@ -54,7 +74,7 @@ describe('custom_fields with real jq', () => {
     const items = [{
       metadata: { name: 'cluster-abc', namespace: 'ns-1', annotations: {}, labels: {} },
     }];
-    mockKubectl(JSON.stringify({ items }));
+    mockClusterList(items);
 
     const { listClustersForContext } = await import('../k8s.js');
     const result = await listClustersForContext(
@@ -78,7 +98,7 @@ describe('custom_fields with real jq', () => {
         labels: { 't8s.teuto.net/customer-id': 'acme' },
       },
     }];
-    mockKubectl(JSON.stringify({ items }));
+    mockClusterList(items);
 
     const { listClustersForContext } = await import('../k8s.js');
     const result = await listClustersForContext(
@@ -98,7 +118,7 @@ describe('custom_fields with real jq', () => {
         labels: { 't8s.teuto.net/customer-id': 'acme-42' },
       },
     }];
-    mockKubectl(JSON.stringify({ items }));
+    mockClusterList(items);
 
     const { listClustersForContext } = await import('../k8s.js');
     const result = await listClustersForContext(
@@ -111,6 +131,7 @@ describe('custom_fields with real jq', () => {
   });
 
   it('evaluates all fields in one jq call across multiple clusters', async () => {
+    spyOnJq();
     const items = [
       {
         metadata: {
@@ -127,7 +148,7 @@ describe('custom_fields with real jq', () => {
         },
       },
     ];
-    mockKubectl(JSON.stringify({ items }));
+    mockClusterList(items);
 
     const { listClustersForContext } = await import('../k8s.js');
     const result = await listClustersForContext(
@@ -138,8 +159,8 @@ describe('custom_fields with real jq', () => {
 
     expect(result[0].custom_fields?.customer_name).toBe('Alpha');
     expect(result[1].custom_fields?.customer_name).toBe('beta');
-    // Verify only one jq call was made (kubectl + jq = 2 total)
-    expect(shell.execFile).toHaveBeenCalledTimes(2);
+    // Verify only one jq call was made across both clusters
+    expect(shell.execFile).toHaveBeenCalledTimes(1);
   });
 });
 

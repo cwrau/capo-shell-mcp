@@ -1,7 +1,5 @@
 import { load, dump } from 'js-yaml';
-import * as fs from 'node:fs/promises';
-import * as os from 'node:os';
-import * as path from 'node:path';
+import * as k8s from '@kubernetes/client-node';
 import { shell } from './shell.js';
 import type { KubeconfigTransforms, ManagementClusterConfig } from './config.js';
 
@@ -13,21 +11,28 @@ export interface CAPOCluster {
   custom_fields?: Record<string, string>;
 }
 
-function withContext(context?: string): string[] {
-  return context ? ['--context', context] : [];
+const CLUSTER_GROUP = 'cluster.x-k8s.io';
+const CLUSTER_VERSION = 'v1beta1';
+const CLUSTER_PLURAL = 'clusters';
+const OPENSTACKCLUSTER_GROUP = 'infrastructure.cluster.x-k8s.io';
+const OPENSTACKCLUSTER_VERSION = 'v1beta1';
+const OPENSTACKCLUSTER_PLURAL = 'openstackclusters';
+
+function kubeConfigFromFile(kubeconfigPath: string, context?: string): k8s.KubeConfig {
+  const kc = new k8s.KubeConfig();
+  kc.loadFromFile(kubeconfigPath);
+  if (context) kc.setCurrentContext(context);
+  return kc;
 }
 
-function kubectlEnv(kubeconfig: string): NodeJS.ProcessEnv {
-  return { ...process.env, KUBECONFIG: kubeconfig };
+function kubeConfigFromYaml(kcYaml: string): k8s.KubeConfig {
+  const kc = new k8s.KubeConfig();
+  kc.loadFromString(kcYaml);
+  return kc;
 }
 
 export async function getContexts(kubeconfig: string): Promise<string[]> {
-  const { stdout } = await shell.execFile(
-    'kubectl',
-    ['config', 'get-contexts', '-o', 'name'],
-    { env: kubectlEnv(kubeconfig) },
-  );
-  return stdout.trim().split('\n').filter(Boolean);
+  return kubeConfigFromFile(kubeconfig).getContexts().map((c) => c.name);
 }
 
 export async function listClustersForContext(
@@ -35,14 +40,14 @@ export async function listClustersForContext(
   context: string,
   customFields?: Record<string, string>,
 ): Promise<CAPOCluster[]> {
-  const { stdout } = await shell.execFile(
-    'kubectl',
-    [...withContext(context), 'get', 'cluster', '-A', '-o', 'json'],
-    { env: kubectlEnv(mgmt.kubeconfig) },
-  );
-  const parsed = JSON.parse(stdout) as { items: Array<{ metadata: { name: string; namespace: string } }> };
+  const api = kubeConfigFromFile(mgmt.kubeconfig, context).makeApiClient(k8s.CustomObjectsApi);
+  const result = await api.listCustomObjectForAllNamespaces({
+    group: CLUSTER_GROUP,
+    version: CLUSTER_VERSION,
+    plural: CLUSTER_PLURAL,
+  }) as { items: Array<{ metadata: { name: string; namespace: string } }> };
 
-  const clusters: CAPOCluster[] = parsed.items.map((item) => ({
+  const clusters: CAPOCluster[] = result.items.map((item) => ({
     management_cluster: mgmt.name,
     context,
     namespace: item.metadata.namespace,
@@ -57,7 +62,7 @@ export async function listClustersForContext(
   const { stdout: jqOut } = await shell.execFile(
     'jq',
     [`[.items[] | {${fieldExprs}}]`],
-    { input: stdout },
+    { input: JSON.stringify(result) },
   );
   const fieldValues = JSON.parse(jqOut) as Array<Record<string, string | null>>;
 
@@ -78,17 +83,11 @@ export async function fetchWorkloadKubeconfig(
   namespace: string,
   clusterName: string,
 ): Promise<string> {
-  const { stdout } = await shell.execFile(
-    'kubectl',
-    [
-      ...withContext(context),
-      '-n', namespace,
-      'get', 'secret', `${clusterName}-kubeconfig`,
-      '-o', 'jsonpath={.data.value}',
-    ],
-    { env: kubectlEnv(mgmt.kubeconfig) },
-  );
-  return Buffer.from(stdout.trim(), 'base64').toString('utf8');
+  const api = kubeConfigFromFile(mgmt.kubeconfig, context).makeApiClient(k8s.CoreV1Api);
+  const secret = await api.readNamespacedSecret({ name: `${clusterName}-kubeconfig`, namespace });
+  const value = secret.data?.value;
+  if (!value) throw new Error(`fetchWorkloadKubeconfig: secret '${clusterName}-kubeconfig' has no 'value' key`);
+  return Buffer.from(value, 'base64').toString('utf8');
 }
 
 export async function applyKubeconfigTransform(kcYaml: string, transforms: KubeconfigTransforms): Promise<string> {
@@ -101,43 +100,56 @@ export async function applyKubeconfigTransform(kcYaml: string, transforms: Kubec
   return dump(JSON.parse(stdout));
 }
 
+async function fetchOpenStackCluster(
+  mgmt: ManagementClusterConfig,
+  context: string,
+  namespace: string,
+  clusterName: string,
+): Promise<{
+  spec: {
+    identityRef?: { name: string };
+    cloudName?: string;
+    apiServerLoadBalancer?: { allowedCIDRs?: string[] };
+    controlPlaneEndpoint?: { host: string; port: string };
+  };
+} | undefined> {
+  const api = kubeConfigFromFile(mgmt.kubeconfig, context).makeApiClient(k8s.CustomObjectsApi);
+  const result = await api.listNamespacedCustomObject({
+    group: OPENSTACKCLUSTER_GROUP,
+    version: OPENSTACKCLUSTER_VERSION,
+    namespace,
+    plural: OPENSTACKCLUSTER_PLURAL,
+    labelSelector: `cluster.x-k8s.io/cluster-name=${clusterName}`,
+  }) as {
+    items: Array<{
+      spec: {
+        identityRef?: { name: string };
+        cloudName?: string;
+        apiServerLoadBalancer?: { allowedCIDRs?: string[] };
+        controlPlaneEndpoint?: { host: string; port: string };
+      };
+    }>;
+  };
+  return result.items[0];
+}
+
 export async function fetchOpenStackEnv(
   mgmt: ManagementClusterConfig,
   context: string,
   namespace: string,
   clusterName: string,
 ): Promise<Record<string, string>> {
-  const { stdout: oscOut } = await shell.execFile(
-    'kubectl',
-    [
-      ...withContext(context),
-      '-n', namespace,
-      'get', 'openstackcluster',
-      '-l', `cluster.x-k8s.io/cluster-name=${clusterName}`,
-      '-o', 'json',
-    ],
-    { env: kubectlEnv(mgmt.kubeconfig) },
-  );
-  const oscList = JSON.parse(oscOut) as {
-    items: Array<{ spec: { identityRef?: { name: string }; cloudName?: string } }>;
-  };
-  const osc = oscList.items[0];
+  const osc = await fetchOpenStackCluster(mgmt, context, namespace, clusterName);
   if (!osc) throw new Error(`No OpenStackCluster found for cluster '${clusterName}' in namespace '${namespace}'`);
 
   const secretName = osc.spec.identityRef?.name ?? `${clusterName}-cloud-config`;
   const cloudName = osc.spec.cloudName ?? 'openstack';
 
-  const { stdout: secretOut } = await shell.execFile(
-    'kubectl',
-    [
-      ...withContext(context),
-      '-n', namespace,
-      'get', 'secret', secretName,
-      '-o', 'jsonpath={.data.clouds\\.yaml}',
-    ],
-    { env: kubectlEnv(mgmt.kubeconfig) },
-  );
-  const cloudsYaml = Buffer.from(secretOut.trim(), 'base64').toString('utf8');
+  const coreApi = kubeConfigFromFile(mgmt.kubeconfig, context).makeApiClient(k8s.CoreV1Api);
+  const secret = await coreApi.readNamespacedSecret({ name: secretName, namespace });
+  const cloudsB64 = secret.data?.['clouds.yaml'];
+  if (!cloudsB64) throw new Error(`Secret '${secretName}' has no 'clouds.yaml' key`);
+  const cloudsYaml = Buffer.from(cloudsB64, 'base64').toString('utf8');
   const clouds = load(cloudsYaml) as {
     clouds: Record<string, {
       auth: Record<string, string>;
@@ -179,57 +191,76 @@ export async function fetchApiServerInfo(
   namespace: string,
   clusterName: string,
 ): Promise<[string, string] | null> {
-  const { stdout } = await shell.execFile(
-    'kubectl',
-    [
-      ...withContext(context),
-      '-n', namespace,
-      'get', 'openstackcluster',
-      '-l', `cluster.x-k8s.io/cluster-name=${clusterName}`,
-      '-o', 'json',
-    ],
-    { env: kubectlEnv(mgmt.kubeconfig) },
-  );
-  const parsed = JSON.parse(stdout) as {
-    items: Array<{
-      spec: {
-        apiServerLoadBalancer?: { allowedCIDRs?: string[] };
-        controlPlaneEndpoint?: { host: string; port: string };
-      };
-    }>;
-  };
-  const item = parsed.items[0];
-  if (!item) return null;
-  if (!item.spec.apiServerLoadBalancer?.allowedCIDRs?.length) return null;
-  const apiHost = item.spec.controlPlaneEndpoint?.host;
-  const apiPort = item.spec.controlPlaneEndpoint?.port;
+  const osc = await fetchOpenStackCluster(mgmt, context, namespace, clusterName);
+  if (!osc || !osc.spec.apiServerLoadBalancer?.allowedCIDRs?.length) return null;
+  const apiHost = osc.spec.controlPlaneEndpoint?.host;
+  const apiPort = osc.spec.controlPlaneEndpoint?.port;
   if (apiHost && apiPort) return [apiHost, apiPort];
   return null;
 }
 
 const READONLY_SA_NAME = 'capo-shell-mcp-read-only';
-const READONLY_NAMESPACE = 'default';
+const READONLY_NAMESPACE = 'kube-system';
 
-const READONLY_MANIFEST = `\
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ${READONLY_SA_NAME}
-  namespace: ${READONLY_NAMESPACE}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: ${READONLY_SA_NAME}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: view
-subjects:
-- kind: ServiceAccount
-  name: ${READONLY_SA_NAME}
-  namespace: ${READONLY_NAMESPACE}
-`;
+const READONLY_CLUSTER_ROLE: k8s.V1ClusterRole = {
+  metadata: { name: READONLY_SA_NAME },
+  rules: [
+    { apiGroups: ['*'], resources: ['*'], verbs: ['get', 'list', 'watch'] },
+    { nonResourceURLs: ['*'], verbs: ['get'] },
+  ],
+};
+
+const READONLY_CLUSTER_ROLE_BINDING: k8s.V1ClusterRoleBinding = {
+  metadata: { name: READONLY_SA_NAME },
+  roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'ClusterRole', name: READONLY_SA_NAME },
+  subjects: [{ kind: 'ServiceAccount', name: READONLY_SA_NAME, namespace: READONLY_NAMESPACE }],
+};
+
+function isConflict(err: unknown): boolean {
+  return err instanceof k8s.ApiException && err.code === 409;
+}
+
+function isImmutableRoleRefError(err: unknown): boolean {
+  if (!(err instanceof k8s.ApiException)) return false;
+  const message = (err.body as { message?: string } | undefined)?.message ?? err.message;
+  return err.code === 422 && message.includes('roleRef') && message.includes('immutable');
+}
+
+async function ensureReadOnlyRbac(kc: k8s.KubeConfig): Promise<void> {
+  const coreApi = kc.makeApiClient(k8s.CoreV1Api);
+  const rbacApi = kc.makeApiClient(k8s.RbacAuthorizationV1Api);
+
+  try {
+    await coreApi.createNamespacedServiceAccount({
+      namespace: READONLY_NAMESPACE,
+      body: { metadata: { name: READONLY_SA_NAME, namespace: READONLY_NAMESPACE } },
+    });
+  } catch (err) {
+    if (!isConflict(err)) throw err;
+  }
+
+  try {
+    await rbacApi.createClusterRole({ body: READONLY_CLUSTER_ROLE });
+  } catch (err) {
+    if (!isConflict(err)) throw err;
+    await rbacApi.replaceClusterRole({ name: READONLY_SA_NAME, body: READONLY_CLUSTER_ROLE });
+  }
+
+  try {
+    await rbacApi.createClusterRoleBinding({ body: READONLY_CLUSTER_ROLE_BINDING });
+    return;
+  } catch (err) {
+    if (!isConflict(err)) throw err;
+  }
+  try {
+    await rbacApi.replaceClusterRoleBinding({ name: READONLY_SA_NAME, body: READONLY_CLUSTER_ROLE_BINDING });
+  } catch (err) {
+    // roleRef is immutable — if it changed since the CRB was created, force a delete+recreate
+    if (!isImmutableRoleRefError(err)) throw err;
+    await rbacApi.deleteClusterRoleBinding({ name: READONLY_SA_NAME });
+    await rbacApi.createClusterRoleBinding({ body: READONLY_CLUSTER_ROLE_BINDING });
+  }
+}
 
 export async function createReadOnlyKubeconfig(
   adminKcYaml: string,
@@ -241,44 +272,36 @@ export async function createReadOnlyKubeconfig(
   const clusterInfo = parsed.clusters[0]?.cluster;
   if (!clusterInfo) throw new Error('createReadOnlyKubeconfig: no cluster found in admin kubeconfig');
 
-  const tmpFile = path.join(
-    os.tmpdir(),
-    `capo-shell-mcp-admin-${Math.random().toString(36).slice(2)}.yaml`,
-  );
-  await fs.writeFile(tmpFile, adminKcYaml, { mode: 0o600 });
+  const kc = kubeConfigFromYaml(adminKcYaml);
+  await ensureReadOnlyRbac(kc);
 
-  try {
-    const env: NodeJS.ProcessEnv = { ...process.env, KUBECONFIG: tmpFile };
+  const coreApi = kc.makeApiClient(k8s.CoreV1Api);
+  const tokenReq = await coreApi.createNamespacedServiceAccountToken({
+    name: READONLY_SA_NAME,
+    namespace: READONLY_NAMESPACE,
+    body: { spec: { audiences: [], expirationSeconds: durationSeconds } },
+  });
+  const token = tokenReq.status?.token;
+  if (!token) throw new Error('createReadOnlyKubeconfig: token request returned no token');
 
-    await shell.execFile('kubectl', ['apply', '-f', '-'], { env, input: READONLY_MANIFEST });
-
-    const { stdout: token } = await shell.execFile(
-      'kubectl',
-      ['create', 'token', READONLY_SA_NAME, '--namespace', READONLY_NAMESPACE, '--duration', `${durationSeconds}s`],
-      { env },
-    );
-
-    return dump({
-      apiVersion: 'v1',
-      kind: 'Config',
-      clusters: [{
-        name: 'workload',
-        cluster: {
-          server: clusterInfo.server,
-          'certificate-authority-data': clusterInfo['certificate-authority-data'],
-        },
-      }],
-      contexts: [{
-        name: 'readonly',
-        context: { cluster: 'workload', user: READONLY_SA_NAME, namespace: READONLY_NAMESPACE },
-      }],
-      'current-context': 'readonly',
-      users: [{
-        name: READONLY_SA_NAME,
-        user: { token: token.trim() },
-      }],
-    });
-  } finally {
-    await fs.unlink(tmpFile).catch(() => undefined);
-  }
+  return dump({
+    apiVersion: 'v1',
+    kind: 'Config',
+    clusters: [{
+      name: 'workload',
+      cluster: {
+        server: clusterInfo.server,
+        'certificate-authority-data': clusterInfo['certificate-authority-data'],
+      },
+    }],
+    contexts: [{
+      name: 'readonly',
+      context: { cluster: 'workload', user: READONLY_SA_NAME, namespace: READONLY_NAMESPACE },
+    }],
+    'current-context': 'readonly',
+    users: [{
+      name: READONLY_SA_NAME,
+      user: { token: token.trim() },
+    }],
+  });
 }

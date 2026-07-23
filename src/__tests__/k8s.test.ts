@@ -1,78 +1,99 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { shell } from '../shell.js';
-import * as fsPromises from 'node:fs/promises';
 
-vi.mock('node:fs/promises');
+const stubs = vi.hoisted(() => ({
+  contexts: [] as string[],
+  coreV1: {} as Record<string, ReturnType<typeof vi.fn>>,
+  customObjects: {} as Record<string, ReturnType<typeof vi.fn>>,
+  rbac: {} as Record<string, ReturnType<typeof vi.fn>>,
+}));
+
+vi.mock('@kubernetes/client-node', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kubernetes/client-node')>();
+
+  class FakeKubeConfig {
+    loadFromFile(_path: string) {}
+    loadFromString(_yaml: string) {}
+    setCurrentContext(_ctx: string) {}
+    getContexts() {
+      return stubs.contexts.map((name) => ({ name }));
+    }
+    makeApiClient(apiClientType: unknown) {
+      if (apiClientType === actual.CoreV1Api) return stubs.coreV1;
+      if (apiClientType === actual.CustomObjectsApi) return stubs.customObjects;
+      if (apiClientType === actual.RbacAuthorizationV1Api) return stubs.rbac;
+      throw new Error('unexpected api client type in test');
+    }
+  }
+
+  return { ...actual, KubeConfig: FakeKubeConfig };
+});
 
 const mgmt = { name: 'prod', kubeconfig: '/kube/prod.yaml', context: undefined };
+
+beforeEach(() => {
+  stubs.contexts = [];
+  stubs.coreV1 = {};
+  stubs.customObjects = {};
+  stubs.rbac = {};
+});
 
 describe('getContexts', () => {
   afterEach(() => vi.restoreAllMocks());
 
   it('returns list of context names', async () => {
-    vi.spyOn(shell, 'execFile').mockResolvedValue({ stdout: 'ctx-a\nctx-b\n', stderr: '' });
+    stubs.contexts = ['ctx-a', 'ctx-b'];
     const { getContexts } = await import('../k8s.js');
     const result = await getContexts('/kube/prod.yaml');
     expect(result).toEqual(['ctx-a', 'ctx-b']);
-    expect(shell.execFile).toHaveBeenCalledWith(
-      'kubectl',
-      ['config', 'get-contexts', '-o', 'name'],
-      expect.objectContaining({ env: expect.objectContaining({ KUBECONFIG: '/kube/prod.yaml' }) }),
-    );
   });
 });
 
 describe('listClustersForContext', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('parses cluster list from kubectl json output', async () => {
+  it('parses cluster list from the API response', async () => {
     const items = [
       { metadata: { name: 'cluster-1', namespace: 'ns-1' } },
       { metadata: { name: 'cluster-2', namespace: 'ns-2' } },
     ];
-    vi.spyOn(shell, 'execFile').mockResolvedValue({ stdout: JSON.stringify({ items }), stderr: '' });
+    stubs.customObjects.listCustomObjectForAllNamespaces = vi.fn().mockResolvedValue({ items });
     const { listClustersForContext } = await import('../k8s.js');
     const result = await listClustersForContext(mgmt, 'ctx-a');
     expect(result).toEqual([
       { management_cluster: 'prod', context: 'ctx-a', namespace: 'ns-1', name: 'cluster-1' },
       { management_cluster: 'prod', context: 'ctx-a', namespace: 'ns-2', name: 'cluster-2' },
     ]);
+    expect(stubs.customObjects.listCustomObjectForAllNamespaces).toHaveBeenCalledWith(
+      expect.objectContaining({ group: 'cluster.x-k8s.io', version: 'v1beta1', plural: 'clusters' }),
+    );
   });
 
   it('returns empty array when no clusters', async () => {
-    vi.spyOn(shell, 'execFile').mockResolvedValue({ stdout: JSON.stringify({ items: [] }), stderr: '' });
+    stubs.customObjects.listCustomObjectForAllNamespaces = vi.fn().mockResolvedValue({ items: [] });
     const { listClustersForContext } = await import('../k8s.js');
     const result = await listClustersForContext(mgmt, 'ctx-a');
     expect(result).toEqual([]);
   });
 
   it('populates custom_fields from jq expressions', async () => {
-    const kubectlOut = JSON.stringify({ items: [{ metadata: { name: 'cluster-1', namespace: 'ns-1' } }] });
-    const jqOut = JSON.stringify([{ friendly_name: 'My Cluster', customer_name: 'acme' }]);
-
-    vi.spyOn(shell, 'execFile')
-      .mockResolvedValueOnce({ stdout: kubectlOut, stderr: '' })
-      .mockResolvedValueOnce({ stdout: jqOut, stderr: '' });
+    const items = [{ metadata: { name: 'cluster-1', namespace: 'ns-1' } }];
+    stubs.customObjects.listCustomObjectForAllNamespaces = vi.fn().mockResolvedValue({ items });
 
     const { listClustersForContext } = await import('../k8s.js');
     const customFields = {
-      friendly_name: '.metadata.annotations["example.com/name"] | @base64d',
-      customer_name: '.metadata.labels["example.com/customer"]',
+      friendly_name: '"My Cluster"',
+      customer_name: '"acme"',
     };
     const result = await listClustersForContext(mgmt, 'ctx-a', customFields);
     expect(result[0].custom_fields).toEqual({ friendly_name: 'My Cluster', customer_name: 'acme' });
   });
 
   it('skips null/empty custom field values', async () => {
-    const kubectlOut = JSON.stringify({ items: [{ metadata: { name: 'c', namespace: 'ns' } }] });
-    const jqOut = JSON.stringify([{ friendly_name: null, customer_name: '' }]);
-
-    vi.spyOn(shell, 'execFile')
-      .mockResolvedValueOnce({ stdout: kubectlOut, stderr: '' })
-      .mockResolvedValueOnce({ stdout: jqOut, stderr: '' });
+    const items = [{ metadata: { name: 'c', namespace: 'ns' } }];
+    stubs.customObjects.listCustomObjectForAllNamespaces = vi.fn().mockResolvedValue({ items });
 
     const { listClustersForContext } = await import('../k8s.js');
-    const customFields = { friendly_name: '.metadata.annotations["missing"] // null', customer_name: '""' };
+    const customFields = { friendly_name: 'null', customer_name: '""' };
     const result = await listClustersForContext(mgmt, 'ctx-a', customFields);
     expect(result[0].custom_fields).toBeUndefined();
   });
@@ -84,15 +105,14 @@ describe('fetchWorkloadKubeconfig', () => {
   it('base64-decodes the secret value', async () => {
     const rawKubeconfig = 'apiVersion: v1\nclusters: []';
     const encoded = Buffer.from(rawKubeconfig).toString('base64');
-    vi.spyOn(shell, 'execFile').mockResolvedValue({ stdout: encoded, stderr: '' });
+    stubs.coreV1.readNamespacedSecret = vi.fn().mockResolvedValue({ data: { value: encoded } });
     const { fetchWorkloadKubeconfig } = await import('../k8s.js');
     const result = await fetchWorkloadKubeconfig(mgmt, 'ctx-a', 'ns-1', 'cluster-1');
     expect(result).toBe(rawKubeconfig);
-    expect(shell.execFile).toHaveBeenCalledWith(
-      'kubectl',
-      expect.arrayContaining(['-n', 'ns-1', 'get', 'secret', 'cluster-1-kubeconfig']),
-      expect.anything(),
-    );
+    expect(stubs.coreV1.readNamespacedSecret).toHaveBeenCalledWith({
+      name: 'cluster-1-kubeconfig',
+      namespace: 'ns-1',
+    });
   });
 });
 
@@ -146,10 +166,8 @@ describe('fetchOpenStackEnv', () => {
   afterEach(() => vi.restoreAllMocks());
 
   it('uses label selector and extracts OS env vars', async () => {
-    const oscJson = JSON.stringify({
-      items: [{
-        spec: { identityRef: { name: 'os-creds' }, cloudName: 'openstack' },
-      }],
+    stubs.customObjects.listNamespacedCustomObject = vi.fn().mockResolvedValue({
+      items: [{ spec: { identityRef: { name: 'os-creds' }, cloudName: 'openstack' } }],
     });
     const cloudsYaml = `
 clouds:
@@ -161,24 +179,15 @@ clouds:
     region_name: RegionOne
 `;
     const encoded = Buffer.from(cloudsYaml).toString('base64');
-
-    vi.spyOn(shell, 'execFile')
-      .mockResolvedValueOnce({ stdout: oscJson, stderr: '' })
-      .mockResolvedValueOnce({ stdout: encoded, stderr: '' });
+    stubs.coreV1.readNamespacedSecret = vi.fn().mockResolvedValue({ data: { 'clouds.yaml': encoded } });
 
     const { fetchOpenStackEnv } = await import('../k8s.js');
     const env = await fetchOpenStackEnv(mgmt, 'ctx-a', 'ns-1', 'cluster-1');
 
-    // Assert label selector was used
-    expect(shell.execFile).toHaveBeenNthCalledWith(
-      1,
-      'kubectl',
-      expect.arrayContaining([
-        'get', 'openstackcluster',
-        '-l', 'cluster.x-k8s.io/cluster-name=cluster-1',
-      ]),
-      expect.anything(),
+    expect(stubs.customObjects.listNamespacedCustomObject).toHaveBeenCalledWith(
+      expect.objectContaining({ labelSelector: 'cluster.x-k8s.io/cluster-name=cluster-1' }),
     );
+    expect(stubs.coreV1.readNamespacedSecret).toHaveBeenCalledWith({ name: 'os-creds', namespace: 'ns-1' });
 
     expect(env.OS_AUTH_URL).toBe('https://keystone.example.com/v3');
     expect(env.OS_APPLICATION_CREDENTIAL_ID).toBe('cred-id');
@@ -187,10 +196,7 @@ clouds:
   });
 
   it('throws when no OpenStackCluster found', async () => {
-    vi.spyOn(shell, 'execFile').mockResolvedValue({
-      stdout: JSON.stringify({ items: [] }),
-      stderr: '',
-    });
+    stubs.customObjects.listNamespacedCustomObject = vi.fn().mockResolvedValue({ items: [] });
     const { fetchOpenStackEnv } = await import('../k8s.js');
     await expect(fetchOpenStackEnv(mgmt, 'ctx-a', 'ns-1', 'cluster-1'))
       .rejects.toThrow(/No OpenStackCluster found/);
@@ -201,55 +207,38 @@ describe('fetchApiServerInfo', () => {
   afterEach(() => vi.restoreAllMocks());
 
   it('returns null when no items', async () => {
-    vi.spyOn(shell, 'execFile').mockResolvedValue({
-      stdout: JSON.stringify({ items: [] }),
-      stderr: '',
-    });
+    stubs.customObjects.listNamespacedCustomObject = vi.fn().mockResolvedValue({ items: [] });
     const { fetchApiServerInfo } = await import('../k8s.js');
     expect(await fetchApiServerInfo(mgmt, 'ctx-a', 'ns-1', 'cluster-1')).toBeNull();
   });
 
   it('returns null when no allowedCIDRs', async () => {
-    vi.spyOn(shell, 'execFile').mockResolvedValue({
-      stdout: JSON.stringify({
-        items: [{ spec: { controlPlaneEndpoint: { host: '10.0.0.1' } } }],
-      }),
-      stderr: '',
+    stubs.customObjects.listNamespacedCustomObject = vi.fn().mockResolvedValue({
+      items: [{ spec: { controlPlaneEndpoint: { host: '10.0.0.1' } } }],
     });
     const { fetchApiServerInfo } = await import('../k8s.js');
     expect(await fetchApiServerInfo(mgmt, 'ctx-a', 'ns-1', 'cluster-1')).toBeNull();
   });
 
   it('returns [host, port] when allowedCIDRs present', async () => {
-    vi.spyOn(shell, 'execFile').mockResolvedValue({
-      stdout: JSON.stringify({
-        items: [{
-          spec: {
-            apiServerLoadBalancer: { allowedCIDRs: ['0.0.0.0/0'] },
-            controlPlaneEndpoint: { host: '10.0.0.1', port: '6443' },
-          },
-        }],
-      }),
-      stderr: '',
+    stubs.customObjects.listNamespacedCustomObject = vi.fn().mockResolvedValue({
+      items: [{
+        spec: {
+          apiServerLoadBalancer: { allowedCIDRs: ['0.0.0.0/0'] },
+          controlPlaneEndpoint: { host: '10.0.0.1', port: '6443' },
+        },
+      }],
     });
     const { fetchApiServerInfo } = await import('../k8s.js');
     expect(await fetchApiServerInfo(mgmt, 'ctx-a', 'ns-1', 'cluster-1')).toEqual(['10.0.0.1', '6443']);
   });
 
   it('uses label selector', async () => {
-    vi.spyOn(shell, 'execFile').mockResolvedValue({
-      stdout: JSON.stringify({ items: [] }),
-      stderr: '',
-    });
+    stubs.customObjects.listNamespacedCustomObject = vi.fn().mockResolvedValue({ items: [] });
     const { fetchApiServerInfo } = await import('../k8s.js');
     await fetchApiServerInfo(mgmt, 'ctx-a', 'ns-1', 'cluster-1');
-    expect(shell.execFile).toHaveBeenCalledWith(
-      'kubectl',
-      expect.arrayContaining([
-        'get', 'openstackcluster',
-        '-l', 'cluster.x-k8s.io/cluster-name=cluster-1',
-      ]),
-      expect.anything(),
+    expect(stubs.customObjects.listNamespacedCustomObject).toHaveBeenCalledWith(
+      expect.objectContaining({ labelSelector: 'cluster.x-k8s.io/cluster-name=cluster-1' }),
     );
   });
 });
@@ -275,44 +264,88 @@ users:
     token: old-admin-token
 `;
 
-  beforeEach(() => {
-    vi.mocked(fsPromises.writeFile).mockResolvedValue(undefined);
-    vi.mocked(fsPromises.unlink).mockResolvedValue(undefined);
-  });
+  function mockRbacHappyPath() {
+    stubs.coreV1.createNamespacedServiceAccount = vi.fn().mockResolvedValue({});
+    stubs.rbac.createClusterRole = vi.fn().mockResolvedValue({});
+    stubs.rbac.createClusterRoleBinding = vi.fn().mockResolvedValue({});
+    stubs.coreV1.createNamespacedServiceAccountToken = vi.fn().mockResolvedValue({
+      status: { token: 'mytoken' },
+    });
+  }
 
   afterEach(() => vi.restoreAllMocks());
 
-  it('applies SA and CRB then creates token', async () => {
-    vi.spyOn(shell, 'execFile')
-      .mockResolvedValueOnce({ stdout: '', stderr: '' })         // kubectl apply
-      .mockResolvedValueOnce({ stdout: 'mytoken\n', stderr: '' }); // kubectl create token
+  it('creates SA, ClusterRole, ClusterRoleBinding, then a token', async () => {
+    mockRbacHappyPath();
 
     const { createReadOnlyKubeconfig } = await import('../k8s.js');
     await createReadOnlyKubeconfig(adminKcYaml, 3600);
 
-    expect(shell.execFile).toHaveBeenNthCalledWith(
-      1,
-      'kubectl',
-      ['apply', '-f', '-'],
+    expect(stubs.coreV1.createNamespacedServiceAccount).toHaveBeenCalledWith({
+      namespace: 'kube-system',
+      body: { metadata: { name: 'capo-shell-mcp-read-only', namespace: 'kube-system' } },
+    });
+    expect(stubs.rbac.createClusterRole).toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.objectContaining({ metadata: { name: 'capo-shell-mcp-read-only' } }) }),
+    );
+    expect(stubs.rbac.createClusterRoleBinding).toHaveBeenCalledWith(
       expect.objectContaining({
-        input: expect.stringContaining('capo-shell-mcp-read-only'),
-        env: expect.objectContaining({ KUBECONFIG: expect.stringMatching(/\.yaml$/) }),
+        body: expect.objectContaining({
+          roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'ClusterRole', name: 'capo-shell-mcp-read-only' },
+        }),
       }),
     );
-    expect(shell.execFile).toHaveBeenNthCalledWith(
-      2,
-      'kubectl',
-      ['create', 'token', 'capo-shell-mcp-read-only', '--namespace', 'default', '--duration', '3600s'],
-      expect.objectContaining({
-        env: expect.objectContaining({ KUBECONFIG: expect.stringMatching(/\.yaml$/) }),
-      }),
+    expect(stubs.coreV1.createNamespacedServiceAccountToken).toHaveBeenCalledWith({
+      name: 'capo-shell-mcp-read-only',
+      namespace: 'kube-system',
+      body: { spec: { audiences: [], expirationSeconds: 3600 } },
+    });
+  });
+
+  it('ignores AlreadyExists conflicts for ServiceAccount and updates an existing ClusterRole', async () => {
+    const { ApiException } = await import('@kubernetes/client-node');
+    mockRbacHappyPath();
+    stubs.coreV1.createNamespacedServiceAccount = vi.fn().mockRejectedValue(
+      new ApiException(409, 'Conflict', { message: 'already exists' }, {}),
+    );
+    stubs.rbac.createClusterRole = vi.fn().mockRejectedValue(
+      new ApiException(409, 'Conflict', { message: 'already exists' }, {}),
+    );
+    stubs.rbac.replaceClusterRole = vi.fn().mockResolvedValue({});
+
+    const { createReadOnlyKubeconfig } = await import('../k8s.js');
+    await createReadOnlyKubeconfig(adminKcYaml, 3600);
+
+    expect(stubs.rbac.replaceClusterRole).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'capo-shell-mcp-read-only' }),
     );
   });
 
+  it('falls back to delete+recreate when the ClusterRoleBinding roleRef is immutable', async () => {
+    const { ApiException } = await import('@kubernetes/client-node');
+    mockRbacHappyPath();
+    stubs.rbac.createClusterRoleBinding = vi.fn()
+      .mockRejectedValueOnce(new ApiException(409, 'Conflict', { message: 'already exists' }, {}))
+      .mockResolvedValueOnce({});
+    stubs.rbac.replaceClusterRoleBinding = vi.fn().mockRejectedValue(
+      new ApiException(422, 'Invalid', {
+        message: 'ClusterRoleBinding.rbac.authorization.k8s.io "capo-shell-mcp-read-only" is invalid: roleRef: Invalid value: ...: roleRef is immutable',
+      }, {}),
+    );
+    stubs.rbac.deleteClusterRoleBinding = vi.fn().mockResolvedValue({});
+
+    const { createReadOnlyKubeconfig } = await import('../k8s.js');
+    await createReadOnlyKubeconfig(adminKcYaml, 3600);
+
+    expect(stubs.rbac.replaceClusterRoleBinding).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'capo-shell-mcp-read-only' }),
+    );
+    expect(stubs.rbac.deleteClusterRoleBinding).toHaveBeenCalledWith({ name: 'capo-shell-mcp-read-only' });
+    expect(stubs.rbac.createClusterRoleBinding).toHaveBeenCalledTimes(2);
+  });
+
   it('returns kubeconfig YAML with token, server, and CA data', async () => {
-    vi.spyOn(shell, 'execFile')
-      .mockResolvedValueOnce({ stdout: '', stderr: '' })
-      .mockResolvedValueOnce({ stdout: 'mytoken\n', stderr: '' });
+    mockRbacHappyPath();
 
     const { createReadOnlyKubeconfig } = await import('../k8s.js');
     const result = await createReadOnlyKubeconfig(adminKcYaml, 3600);
@@ -329,38 +362,14 @@ users:
     expect(parsed['current-context']).toBe('readonly');
   });
 
-  it('includes SA and CRB in apply manifest', async () => {
-    let capturedInput = '';
-    vi.spyOn(shell, 'execFile').mockImplementation(async (_bin, args, opts) => {
-      if (args[0] === 'apply') capturedInput = (opts as { input?: string }).input ?? '';
-      return { stdout: 'tok\n', stderr: '' };
-    });
-
+  it('throws when the token request returns no token', async () => {
+    mockRbacHappyPath();
+    stubs.coreV1.createNamespacedServiceAccountToken = vi.fn().mockResolvedValue({ status: {} });
     const { createReadOnlyKubeconfig } = await import('../k8s.js');
-    await createReadOnlyKubeconfig(adminKcYaml, 60);
-
-    expect(capturedInput).toContain('kind: ServiceAccount');
-    expect(capturedInput).toContain('kind: ClusterRoleBinding');
-    expect(capturedInput).toContain('name: view');
-    expect(capturedInput).toContain('namespace: default');
-  });
-
-  it('deletes temp file on success', async () => {
-    vi.spyOn(shell, 'execFile').mockResolvedValue({ stdout: 'tok\n', stderr: '' });
-    const { createReadOnlyKubeconfig } = await import('../k8s.js');
-    await createReadOnlyKubeconfig(adminKcYaml, 60);
-    expect(fsPromises.unlink).toHaveBeenCalledOnce();
-  });
-
-  it('deletes temp file when kubectl apply fails', async () => {
-    vi.spyOn(shell, 'execFile').mockRejectedValue(new Error('apply failed'));
-    const { createReadOnlyKubeconfig } = await import('../k8s.js');
-    await expect(createReadOnlyKubeconfig(adminKcYaml, 60)).rejects.toThrow('apply failed');
-    expect(fsPromises.unlink).toHaveBeenCalledOnce();
+    await expect(createReadOnlyKubeconfig(adminKcYaml, 60)).rejects.toThrow(/no token/);
   });
 
   it('throws when admin kubeconfig has no clusters', async () => {
-    vi.spyOn(shell, 'execFile').mockResolvedValue({ stdout: '', stderr: '' });
     const { createReadOnlyKubeconfig } = await import('../k8s.js');
     const empty = 'apiVersion: v1\nkind: Config\nclusters: []\n';
     await expect(createReadOnlyKubeconfig(empty, 60)).rejects.toThrow(/no cluster/);
