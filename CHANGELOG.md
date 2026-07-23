@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0](https://github.com/cwrau/capo-shell-mcp/compare/capo-shell-mcp-v0.3.0...capo-shell-mcp-v0.4.0) (2026-07-23)
+
+
+### Features
+
+* use native api calls ([333f471](https://github.com/cwrau/capo-shell-mcp/commit/333f4711876b2a44bdaec7a37b278d645e8d66bc))
+
+
+### Bug Fixes
+
+* override @hono/node-server to patch path-traversal advisory ([0451294](https://github.com/cwrau/capo-shell-mcp/commit/0451294722743b26e04d885d711893d83c32063d))
+
 ## [0.3.0](https://github.com/cwrau/capo-shell-mcp/compare/capo-shell-mcp-v0.2.0...capo-shell-mcp-v0.3.0) (2026-07-01)
 
 
